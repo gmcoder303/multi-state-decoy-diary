@@ -2,7 +2,7 @@
 
 A privacy-focused digital diary with multi-factor authentication, decoy access, panic locking, and persistent encrypted entries.
 
-**Live:** https://multi-state-decoy-diary-ijr32w5cs-vibecode-1eeb.vercel.app/
+**Live:** https://multi-state-decoy-diary.vercel.app/
 
 ## Features
 
