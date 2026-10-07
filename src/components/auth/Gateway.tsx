@@ -33,7 +33,7 @@ export function Gateway() {
         setDots((d) => d + ".");
         await new Promise((r) => setTimeout(r, 90));
       }
-      if (!cancelled && !cancelRef.current) enterAuth();
+      if (!cancelled && !cancelRef.current) void enterAuth();
     })();
     return () => {
       cancelled = true;

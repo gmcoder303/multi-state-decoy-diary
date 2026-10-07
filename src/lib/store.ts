@@ -14,6 +14,7 @@ import {
   fetchVault,
   updateEntryRow,
 } from "@/lib/api";
+import { diag, errorCategory } from "@/lib/diag";
 import type {
   AppPhase,
   DecryptedEntry,
@@ -67,7 +68,7 @@ interface DiaryState {
   boot: () => Promise<void>;
   refreshArchive: () => Promise<void>;
   beginGateway: () => void;
-  enterAuth: () => void;
+  enterAuth: () => Promise<void>;
   cancelAuth: () => void;
   unlockSuccess: (
     key: CryptoKey,
@@ -101,6 +102,42 @@ interface DiaryState {
 
 let toastId = 0;
 
+/**
+ * Client-side "a vault has been created in this browser" marker.
+ *
+ * This is NOT a credential and NOT a substitute for the server: it only
+ * records that setup completed, so a transient fetch failure during boot
+ * can never downgrade an existing vault back to the SETUP screen. The
+ * authoritative source remains GET /api/vault; the flag is only consulted * when that fetch fails, and it is cleared whenever the server *authoritatively* reports no vault (e.g. after an emergency wipe). * It reveals nothing the server's own GET response does not already reveal. */
+const VAULT_SEEN_KEY = "archive.vault.seen";
+
+function markVaultSeen(): void {
+  try {
+    window.localStorage.setItem(VAULT_SEEN_KEY, "1");
+  } catch {
+    /* private mode — ignore */
+  }
+}
+
+function clearVaultSeen(): void {
+  try {
+    window.localStorage.removeItem(VAULT_SEEN_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function vaultSeen(): boolean {
+  try {
+    return window.localStorage.getItem(VAULT_SEEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** In-flight resolution of "does a vault exist?" started by :unlock. */
+let modeResolution: Promise<void> | null = null;
+
 export const useDiary = create<DiaryState>((set, get) => ({
   phase: "boot",
   booted: false,
@@ -129,45 +166,101 @@ export const useDiary = create<DiaryState>((set, get) => ({
     } catch {
       /* private mode — ignore */
     }
-    try {
-      const [vaultRow, rows] = await Promise.all([
-        fetchVault(),
-        fetchEntryRows(),
-      ]);
-      set({
-        phase: "archive",
-        booted: true,
-        vault: vaultRow,
-        vaultExists: vaultRow !== null,
-        archiveRows: rows,
-        theme,
+
+    // Independent fetches: a failure of one must not discard the other's
+    // result (previously Promise.all threw away the vault row when the    // entries fetch failed, which wrongly reset the app to SETUP mode).
+    const [vaultRes, rowsRes] = await Promise.allSettled([
+      fetchVault(),
+      fetchEntryRows(),
+    ]);
+
+    if (vaultRes.status === "rejected") {
+      diag("boot:vault-fetch-failed", {
+        category: errorCategory(vaultRes.reason),
       });
-    } catch {
-      // Even offline/boot errors look like archive corruption. Stay in character.
-      set({ phase: "archive", booted: true, theme });
     }
+    if (rowsRes.status === "rejected") {
+      diag("boot:entries-fetch-failed", {
+        category: errorCategory(rowsRes.reason),
+      });
+    }
+
+    let vaultRow: VaultRow | null | undefined; // undefined = unknown
+    if (vaultRes.status === "fulfilled") {
+      vaultRow = vaultRes.value;
+      if (vaultRow === null) clearVaultSeen(); // server-authoritative: none
+    }
+
+    const rows =
+      rowsRes.status === "fulfilled" ? rowsRes.value : ([] as EncEntryRow[]);
+
+    set({
+      phase: "archive",
+      booted: true,
+      ...(vaultRow !== undefined
+        ? { vault: vaultRow, vaultExists: vaultRow !== null }
+        : // fetch failed — fall back to the local marker so SETUP can        // never reappear on a browser that already completed setup
+          { vaultExists: vaultSeen() }),
+      archiveRows: rows,
+      theme,
+    });
   },
 
   refreshArchive: async () => {
     try {
       const rows = await fetchEntryRows();
       set({ archiveRows: rows });
-    } catch {
+    } catch (err) {
       /* corruption hides failures */
+      diag("archive:refresh-failed", { category: errorCategory(err) });
     }
   },
 
+  /**
+   * :unlock — starts a FRESH vault lookup so setup-vs-unlock mode is
+   * decided by the server's current state, not by whatever the boot
+   * fetch managed to see (a boot-time network blip must never send an
+   * existing vault back to the SETUP screen).
+   */
   beginGateway: () => {
-    const { vaultExists } = get();
-    set({ phase: "gateway", authMode: vaultExists ? "unlock" : "setup" });
+    set({ phase: "gateway" });
+    modeResolution = (async () => {
+      try {
+        const row = await fetchVault();
+        if (row === null) clearVaultSeen();
+        set({ vault: row, vaultExists: row !== null });
+        diag("gateway:vault-resolved", { exists: row !== null });
+      } catch (err) {
+        diag("gateway:vault-fetch-failed", {
+          category: errorCategory(err),
+        });
+        // Keep last known state; only the local marker can assert existence.
+        set({ vaultExists: get().vault !== null || vaultSeen() });
+      }
+    })();
   },
 
-  enterAuth: () => set({ phase: "auth" }),
+  enterAuth: async () => {
+    if (modeResolution) {
+      await Promise.race([
+        modeResolution,
+        new Promise((r) => setTimeout(r, 4000)),
+      ]);
+      modeResolution = null;
+    }
+    // Aborted (click-to-abandon) while the lookup was in flight.
+    if (get().phase !== "gateway") return;
+    const exists = get().vaultExists;
+    diag("auth:mode", { mode: exists ? "unlock" : "setup" });
+    set({ phase: "auth", authMode: exists ? "unlock" : "setup" });
+  },
 
   cancelAuth: () => set({ phase: "archive" }),
 
-  unlockSuccess: (key, entries, rowsOverride) =>
-    set({
+  unlockSuccess: (key, entries, rowsOverride) => {
+    // A successful unlock proves the vault exists server-side.
+    markVaultSeen();
+    return set({
       masterKey: key,
       entries,
       phase: "diary",
@@ -179,9 +272,13 @@ export const useDiary = create<DiaryState>((set, get) => ({
       exportOpen: false,
       ghostMode: false,
       effect: null,
-    }),
+    });
+  },
 
-  authFailed: () => set({ phase: "decoy" }),
+  authFailed: () => {
+    diag("auth:failed -> decoy", {});
+    set({ phase: "decoy" });
+  },
 
   /**
    * PANIC LOCK. Synchronous. No confirmation, no message.
@@ -204,6 +301,7 @@ export const useDiary = create<DiaryState>((set, get) => ({
   },
 
   afterWipe: () => {
+    clearVaultSeen();
     set({
       masterKey: null,
       entries: [],
@@ -308,6 +406,7 @@ export async function decryptAll(
   rows: EncEntryRow[],
 ): Promise<DecryptedEntry[]> {
   const out: DecryptedEntry[] = [];
+  let skipped = 0;
   for (const row of rows) {
     try {
       const payload = await decryptJSON<EntryPayload>(key, {
@@ -323,7 +422,12 @@ export async function decryptAll(
       });
     } catch {
       /* undecryptable row — looks like corruption, skip silently */
+      skipped++;
     }
+  }
+  if (skipped > 0) {
+    // Count only — never row contents.
+    diag("decrypt:rows-skipped", { skipped, total: rows.length });
   }
   return out;
 }

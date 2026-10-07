@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { entries } from "@/db/schema";
+import { ensureSchema } from "@/db/migrate";
+import { diag, errorCategory } from "@/lib/diag";
 
 export const dynamic = "force-dynamic";
 
@@ -34,20 +36,27 @@ export async function PUT(
     return NextResponse.json({ error: "invalid payload" }, { status: 400 });
   }
 
-  const updated = await db
-    .update(entries)
-    .set({
-      ciphertext,
-      iv,
-      ...(clue !== undefined ? { clue } : {}),
-      updatedAt: new Date(),
-    })
-    .where(eq(entries.id, id))
-    .returning();
-  if (updated.length === 0) {
-    return NextResponse.json({ error: "not found" }, { status: 404 });
+  try {
+    await ensureSchema();
+    const updated = await db
+      .update(entries)
+      .set({
+        ciphertext,
+        iv,
+        ...(clue !== undefined ? { clue } : {}),
+        updatedAt: new Date(),
+      })
+      .where(eq(entries.id, id))
+      .returning();
+    if (updated.length === 0) {
+      return NextResponse.json({ error: "not found" }, { status: 404 });
+    }
+    return NextResponse.json({ entry: updated[0] });
+  } catch (err) {
+    const category = errorCategory(err);
+    diag("api:entries:update-failed", { category });
+    return NextResponse.json({ error: category }, { status: 500 });
   }
-  return NextResponse.json({ entry: updated[0] });
 }
 
 /** DELETE /api/entries/:id — destroys one encrypted entry. */
@@ -59,6 +68,14 @@ export async function DELETE(
   if (!/^[0-9a-f-]{36}$/i.test(id)) {
     return NextResponse.json({ error: "invalid id" }, { status: 400 });
   }
-  await db.delete(entries).where(eq(entries.id, id));
-  return NextResponse.json({ ok: true });
+  try {
+    await ensureSchema();
+    await db.delete(entries).where(eq(entries.id, id));
+    diag("api:entries:deleted", {});
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    const category = errorCategory(err);
+    diag("api:entries:delete-failed", { category });
+    return NextResponse.json({ error: category }, { status: 500 });
+  }
 }

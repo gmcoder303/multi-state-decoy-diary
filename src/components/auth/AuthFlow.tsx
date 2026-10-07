@@ -17,7 +17,10 @@ import {
   createVault,
   createEntryRow,
   fetchEntryRows,
+  fetchVault,
+  ApiError,
 } from "@/lib/api";
+import { diag, errorCategory } from "@/lib/diag";
 import {
   KDF_ITERATIONS,
   VERIFIER_PLAINTEXT,
@@ -32,6 +35,7 @@ import type {
   DecryptedEntry,
   EncEntryRow,
   EntryPayload,
+  VaultRow,
 } from "@/lib/types";
 import { humanDate } from "@/lib/dates";
 import {
@@ -143,42 +147,102 @@ export function AuthFlow() {
     let freshRows: EncEntryRow[] | undefined;
 
     if (isSetup) {
+      let created: VaultRow | null = null;
+      const salt = generateSalt();
+      diag("setup:begin", {});
+
       try {
-        const salt = generateSalt();
         key = await deriveKey(factors, salt, KDF_ITERATIONS);
-        const verifier = await encryptJSON(key, { v: VERIFIER_PLAINTEXT });
-        const created = await createVault({
-          salt,
-          verifierCiphertext: verifier.ciphertext,
-          verifierIv: verifier.iv,
-          iterations: KDF_ITERATIONS,
-          question: question.trim(),
-        });
-        const seeded = await seedEntries(key);
-        entries = seeded.entries;
-        freshRows = seeded.rows;
+      } catch (err) {
+        diag("setup:derive-key-failed", { category: errorCategory(err) });
+      }
+
+      if (key) {
+        try {
+          const verifier = await encryptJSON(key, { v: VERIFIER_PLAINTEXT });
+          created = await createVault({
+            salt,
+            verifierCiphertext: verifier.ciphertext,
+            verifierIv: verifier.iv,
+            iterations: KDF_ITERATIONS,
+            question: question.trim(),
+          });
+          diag("setup:vault-created", { id: created.id });
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 409) {
+            // A vault already exists (e.g. setup finished in another tab).
+            // Accept it ONLY if our just-derived key verifies against it.
+            diag("setup:vault-already-exists", {});
+            try {
+              const existing = await fetchVault();
+              if (
+                existing &&
+                (await verifyKey(key, {
+                  ciphertext: existing.verifierCiphertext,
+                  iv: existing.verifierIv,
+                }))
+              ) {
+                created = existing;
+              }
+            } catch (err2) {
+              diag("setup:recheck-failed", { category: errorCategory(err2) });
+            }
+          } else {
+            diag("setup:create-vault-failed", {
+              category: errorCategory(err),
+              endpoint: err instanceof ApiError ? err.endpoint : undefined,
+            });
+          }
+        }
+      }
+
+      if (created && key) {
         useDiary.setState({ vault: created, vaultExists: true });
+        // Seeding welcome entries must never undo a successful setup: the
+        // vault (the user's authentication configuration) is already safe.
+        try {
+          const seeded = await seedEntries(key);
+          entries = seeded.entries;
+          freshRows = seeded.rows;
+        } catch (err) {
+          diag("setup:seed-entries-failed", {
+            category: errorCategory(err),
+          });
+        }
         ok = true;
-      } catch {
-        ok = false;
       }
     } else {
-      try {
-        const v = vault;
-        if (!v) throw new Error("no vault");
-        key = await deriveKey(factors, v.salt, v.iterations);
-        const valid = await verifyKey(key, {
-          ciphertext: v.verifierCiphertext,
-          iv: v.verifierIv,
-        });
-        if (valid) {
-          const rows = await fetchEntryRows();
-          entries = await decryptAll(key, rows);
-          freshRows = rows;
-          ok = true;
+      const v = vault;
+      diag("unlock:begin", { hasVault: v !== null });
+      if (!v) {
+        diag("unlock:no-vault-loaded", {});
+      } else {
+        try {
+          key = await deriveKey(factors, v.salt, v.iterations);
+          const valid = await verifyKey(key, {
+            ciphertext: v.verifierCiphertext,
+            iv: v.verifierIv,
+          });
+          if (!valid) {
+            // Wrong factors — expected for anyone who does not know them.
+            // Silent decoy, exactly as designed.
+            diag("unlock:verifier-mismatch", {});
+          } else {
+            try {
+              const rows = await fetchEntryRows();
+              entries = await decryptAll(key, rows);
+              freshRows = rows;
+              ok = true;
+            } catch (err) {
+              diag("unlock:entries-fetch-failed", {
+                category: errorCategory(err),
+                endpoint: err instanceof ApiError ? err.endpoint : undefined,
+              });
+            }
+          }
+        } catch (err) {
+          diag("unlock:derive-key-failed", { category: errorCategory(err) });
         }
-      } catch {
-        ok = false;
       }
     }
 
@@ -193,11 +257,15 @@ export function AuthFlow() {
     if (!mounted.current) return;
 
     if (ok && key) {
+      diag(isSetup ? "setup:success" : "unlock:success", {
+        entries: entries.length,
+      });
       unlockSuccess(key, entries, freshRows);
       if (isSetup) toast("the archive remembers you now", "lock");
     } else {
       // ANY failure — wrong factor, network fault, anything — silently
       // lands in the empty decoy diary. No error is ever displayed.
+      diag(isSetup ? "setup:failed -> decoy" : "unlock:failed -> decoy", {});
       authFailed();
     }
   }

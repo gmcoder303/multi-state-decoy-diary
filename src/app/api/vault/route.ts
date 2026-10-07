@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { db } from "@/db";
 import { entries, vault } from "@/db/schema";
+import { ensureSchema } from "@/db/migrate";
+import { diag, errorCategory } from "@/lib/diag";
 
 export const dynamic = "force-dynamic";
 
@@ -10,11 +12,18 @@ export const dynamic = "force-dynamic";
  * factor. Security rests on PBKDF2 over the five factors.
  */
 export async function GET() {
-  const rows = await db.select().from(vault).limit(1);
-  if (rows.length === 0) {
-    return NextResponse.json({ vault: null }, { status: 200 });
+  try {
+    await ensureSchema();
+    const rows = await db.select().from(vault).limit(1);
+    if (rows.length === 0) {
+      return NextResponse.json({ vault: null }, { status: 200 });
+    }
+    return NextResponse.json({ vault: rows[0] });
+  } catch (err) {
+    const category = errorCategory(err);
+    diag("api:vault:get-failed", { category });
+    return NextResponse.json({ error: category }, { status: 500 });
   }
-  return NextResponse.json({ vault: rows[0] });
 }
 
 /**
@@ -51,17 +60,25 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "invalid payload" }, { status: 400 });
   }
 
-  // Single-vault application: refuse to overwrite an existing vault.
-  const existing = await db.select({ id: vault.id }).from(vault).limit(1);
-  if (existing.length > 0) {
-    return NextResponse.json({ error: "vault exists" }, { status: 409 });
-  }
+  try {
+    await ensureSchema();
+    // Single-vault application: refuse to overwrite an existing vault.
+    const existing = await db.select({ id: vault.id }).from(vault).limit(1);
+    if (existing.length > 0) {
+      return NextResponse.json({ error: "vault exists" }, { status: 409 });
+    }
 
-  const inserted = await db
-    .insert(vault)
-    .values({ salt, verifierCiphertext, verifierIv, iterations, question })
-    .returning();
-  return NextResponse.json({ vault: inserted[0] }, { status: 201 });
+    const inserted = await db
+      .insert(vault)
+      .values({ salt, verifierCiphertext, verifierIv, iterations, question })
+      .returning();
+    diag("api:vault:created", { id: inserted[0].id });
+    return NextResponse.json({ vault: inserted[0] }, { status: 201 });
+  } catch (err) {
+    const category = errorCategory(err);
+    diag("api:vault:create-failed", { category });
+    return NextResponse.json({ error: category }, { status: 500 });
+  }
 }
 
 /**
@@ -71,7 +88,15 @@ export async function POST(req: Request) {
  * what it stores (ciphertext only — nothing readable ever existed here).
  */
 export async function DELETE() {
-  await db.delete(entries);
-  await db.delete(vault);
-  return NextResponse.json({ ok: true });
+  try {
+    await ensureSchema();
+    await db.delete(entries);
+    await db.delete(vault);
+    diag("api:vault:wiped", {});
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    const category = errorCategory(err);
+    diag("api:vault:wipe-failed", { category });
+    return NextResponse.json({ error: category }, { status: 500 });
+  }
 }

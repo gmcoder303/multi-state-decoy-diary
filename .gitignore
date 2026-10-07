@@ -1,0 +1,9 @@
+node_modules/
+.next/
+.tmp/
+.tmp-*.log
+.freebuff/
+*.tsbuildinfo
+.env
+.env.local
+.env.*.local

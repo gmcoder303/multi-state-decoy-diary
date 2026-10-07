@@ -2,16 +2,25 @@ import { NextResponse } from "next/server";
 import { desc } from "drizzle-orm";
 import { db } from "@/db";
 import { entries } from "@/db/schema";
+import { ensureSchema } from "@/db/migrate";
+import { diag, errorCategory } from "@/lib/diag";
 
 export const dynamic = "force-dynamic";
 
 /** GET /api/entries — every row is ciphertext; the server cannot read it. */
 export async function GET() {
-  const rows = await db
-    .select()
-    .from(entries)
-    .orderBy(desc(entries.createdAt));
-  return NextResponse.json({ entries: rows });
+  try {
+    await ensureSchema();
+    const rows = await db
+      .select()
+      .from(entries)
+      .orderBy(desc(entries.createdAt));
+    return NextResponse.json({ entries: rows });
+  } catch (err) {
+    const category = errorCategory(err);
+    diag("api:entries:get-failed", { category });
+    return NextResponse.json({ error: category }, { status: 500 });
+  }
 }
 
 /** POST /api/entries — stores one client-side-encrypted entry. */
@@ -41,9 +50,16 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "invalid payload" }, { status: 400 });
   }
 
-  const inserted = await db
-    .insert(entries)
-    .values({ id, ciphertext, iv, clue })
-    .returning();
-  return NextResponse.json({ entry: inserted[0] }, { status: 201 });
+  try {
+    await ensureSchema();
+    const inserted = await db
+      .insert(entries)
+      .values({ id, ciphertext, iv, clue })
+      .returning();
+    return NextResponse.json({ entry: inserted[0] }, { status: 201 });
+  } catch (err) {
+    const category = errorCategory(err);
+    diag("api:entries:create-failed", { category });
+    return NextResponse.json({ error: category }, { status: 500 });
+  }
 }
